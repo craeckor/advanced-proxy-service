@@ -1,0 +1,33 @@
+{
+  "name": "advanced-proxy-service",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A modern JavaScript proxy service that rewrites websites so they can be browsed through the proxy, with offline archiving.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node src/index.ts",
+    "start:built": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --experimental-strip-types --test test/codec.test.ts test/html.test.ts test/css.test.ts test/js.test.ts test/json.test.ts test/manifest.test.ts test/capture-payload.test.ts test/capture-agent.test.ts test/shim.test.ts test/shim-runtime.test.ts test/headers.test.ts test/cookies.test.ts test/security.test.ts test/router.test.ts test/rebasing.test.ts test/replay-miss.test.ts test/compat-query.test.ts test/multipart.test.ts test/singlefile.test.ts test/integration.test.ts",
+    "test:unit": "node --experimental-strip-types --test test/codec.test.ts test/html.test.ts test/css.test.ts test/js.test.ts test/json.test.ts test/manifest.test.ts test/capture-payload.test.ts test/capture-agent.test.ts test/shim.test.ts test/shim-runtime.test.ts test/headers.test.ts test/cookies.test.ts test/security.test.ts test/router.test.ts test/rebasing.test.ts test/replay-miss.test.ts test/compat-query.test.ts test/multipart.test.ts test/singlefile.test.ts",
+    "lint": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "acorn": "^8.19.0",
+    "css-tree": "^3.2.1",
+    "parse5": "^8.0.1",
+    "pino": "^10.4.0",
+    "undici": "^8.11.2",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/css-tree": "^2.3.10",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
