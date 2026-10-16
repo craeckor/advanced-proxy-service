@@ -542,8 +542,31 @@ function charsetOf(contentType: string | null): string | null {
   return match?.[1] ?? null;
 }
 
+/**
+ * Whether this proxy is serving over TLS, so a rewritten cookie can be marked
+ * `Secure`.
+ *
+ * `request.socket` is read defensively, and that is the whole point of this
+ * function. Node nils it out when it destroys an `IncomingMessage` — see
+ * `internal/streams/destroy.js`, which does `stream.socket = null` for a server
+ * request — and a client that disconnects mid-request is destroyed exactly that
+ * way. Every caller of this function reaches it *after* awaiting the upstream
+ * response, so the disconnect has had a whole round trip in which to happen:
+ * `request.socket` is null by the time a rewritten response is being built, and
+ * an unguarded `.encrypted` on it is a `TypeError` for a request nobody is
+ * waiting for.
+ *
+ * The distinction is deliberate rather than defensive noise. A socket that is
+ * null means the client is gone, not that the connection was insecure, so
+ * returning false is not a guess — the flag it feeds only matters if the
+ * response is read, and it will not be.
+ *
+ * `?.` is not enough on its own: `request.socket` may be non-null with
+ * `encrypted` absent, which is the ordinary HTTP case, and that must stay false
+ * rather than becoming undefined.
+ */
 function isSecure(request: IncomingMessage): boolean {
-  return (request.socket as { encrypted?: boolean }).encrypted === true;
+  return (request.socket as { encrypted?: boolean } | null)?.encrypted === true;
 }
 
 /** Convert a `Headers` instance into a plain object Node will accept. */

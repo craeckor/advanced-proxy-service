@@ -31,6 +31,8 @@ let proxy: Awaited<ReturnType<ProxyServer['listen']>>;
 let proxyPort = 0;
 let dataDir = '';
 let store: ArchiveStore;
+/** The instance's own configuration, kept so a test can build a second handler. */
+let testConfig: ReturnType<typeof parseConfig>;
 
 const ORIGIN_HTML = `<!doctype html>
 <html><head>
@@ -265,6 +267,7 @@ before(async () => {
     log: { level: 'silent' },
     proxy: { maxRewriteBytes: 64 * 1024 },
   });
+  testConfig = config;
 
   const logger = createLogger(config);
   const upstream = new UpstreamClient(config);
@@ -557,6 +560,69 @@ test('refuses a request with ambiguous framing', async () => {
   // outcomes are acceptable; silently proxying it is not.
   if (response !== null) {
     assert.ok([400, 411, 501].includes(response.status), `unexpected status ${response.status}`);
+  }
+});
+
+test('REGRESSION: a request whose socket Node has already nulled is served, not crashed', async () => {
+  // The reported crash: `TypeError: Cannot read properties of null (reading
+  // 'encrypted')`.
+  //
+  // Node sets `request.socket = null` when it destroys an IncomingMessage —
+  // `internal/streams/destroy.js` does exactly that for a server request — and
+  // `abortIncoming` destroys the request when the client disconnects. A
+  // disconnect therefore leaves the socket null for the rest of the request's
+  // life, and the proxy reads it *after* awaiting upstream, so a client that
+  // goes away mid-flight is a null read on the response path.
+  //
+  // The state is forced rather than raced: the disconnect has to land inside the
+  // await for a real client to trigger it, and that interleaving cannot be
+  // scheduled on demand. The guarded expression is what is under test, and this
+  // produces precisely the input it was missing.
+  const upstream = new UpstreamClient(testConfig);
+  const handler = new ProxyHandler(testConfig, createLogger(testConfig), upstream);
+
+  const outcomes: string[] = [];
+  const server = createServer((request, response) => {
+    Object.defineProperty(request, 'socket', { configurable: true, get: () => null });
+    const rest = (request.url ?? '/').replace(`/proxy/plain/`, '');
+    handler
+      .handle('plain', rest, request, response)
+      .then(() => outcomes.push('resolved'))
+      .catch((error: Error) => outcomes.push(`${error.constructor.name}: ${error.message}`));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  const port = typeof address === 'object' && address !== null ? address.port : 0;
+
+  // Two shapes, because `isSecure` is reached from both the passthrough and the
+  // rewriting path, and they read it at different points.
+  //
+  // Each request is bounded by a timeout, and that is not incidental: without
+  // the guard the throw happens *after* the headers have been sent, so nothing
+  // ever ends the response and the client waits for ever. A regression here must
+  // fail the test, and a hang fails nothing.
+  const targets = [
+    `http://127.0.0.1:${originPort}/image.png`, // passthrough
+    `http://127.0.0.1:${originPort}/`, // rewriting
+  ];
+  for (const target of targets) {
+    await fetch(`http://127.0.0.1:${port}/proxy/plain/${encodeURIComponent(target)}`, {
+      signal: AbortSignal.timeout(5000),
+    }).catch(() => undefined);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  server.close();
+  await upstream.close();
+
+  assert.equal(outcomes.length, targets.length, 'every request must settle');
+  for (const outcome of outcomes) {
+    assert.doesNotMatch(
+      outcome,
+      /TypeError/,
+      `a nulled socket must not throw: ${outcome}`,
+    );
+    assert.equal(outcome, 'resolved');
   }
 });
 
