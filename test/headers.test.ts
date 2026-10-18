@@ -8,6 +8,8 @@ import {
 } from '../src/proxy/headers/hop-by-hop.ts';
 import { rewriteResponseHeaders } from '../src/proxy/headers/response.ts';
 import { splitSetCookieHeader } from '../src/proxy/headers/response.ts';
+import { buildPassthroughRequestHeaders } from '../src/proxy/headers/request.ts';
+import { parseConfig } from '../src/config.ts';
 
 test('strips the canonical hop-by-hop set', () => {
   const headers = new Headers();
@@ -216,4 +218,48 @@ test('leaves Access-Control and Referrer-Policy headers untouched', () => {
 
   assert.equal(headers.get('access-control-allow-origin'), '*');
   assert.equal(headers.get('referrer-policy'), 'no-referrer');
+});
+
+// --- the default User-Agent -------------------------------------------------
+
+/**
+ * A request with no `User-Agent` is not a neutral request.
+ *
+ * Adobe's edge answers one with a 7-byte `OK Bot.` body and a `200`, which
+ * renders as a blank white page. The proxy's own fetches are the ones that hit
+ * it: a browser always sends a `User-Agent` on a navigation, while the crawler
+ * and the capture ingest build their headers from an empty set.
+ */
+
+const proxyConfig = parseConfig({ log: { level: 'silent' } }).proxy;
+
+test('REGRESSION: a request with no client User-Agent still sends one upstream', () => {
+  // The crawler's exact call: an empty client-header set.
+  const headers = buildPassthroughRequestHeaders({}, new URL('https://www.adobe.com/'), proxyConfig);
+  const ua = headers.get('user-agent');
+  assert.ok(ua !== null, 'a User-Agent must always be sent');
+  assert.match(ua, /Mozilla\/5\.0/, 'it must be a browser string, not a product token');
+  assert.doesNotMatch(ua, /^node$/i, 'undici\'s default is exactly what origins reject');
+});
+
+test('a client User-Agent is forwarded unchanged, not replaced', () => {
+  // The whole point of mimicking the client is that the origin answers as it
+  // would to that browser, so the default must never override a real one.
+  const headers = buildPassthroughRequestHeaders(
+    { 'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) Custom/1.0' },
+    new URL('https://example.com/'),
+    proxyConfig,
+  );
+  assert.equal(headers.get('user-agent'), 'Mozilla/5.0 (X11; Linux x86_64) Custom/1.0');
+});
+
+test('the default User-Agent applies even when header mimicry is off', () => {
+  // Deliberately unconditional. `mimicClientHeaders: false` means "do not copy
+  // the client's headers", not "send a request no browser would send" — and a
+  // request with no `User-Agent` is exactly the one origins answer with a bot
+  // page. The crawler and the capture ingest both start from an empty header
+  // set, so this is their normal path rather than an edge case.
+  const off = parseConfig({ log: { level: 'silent' }, proxy: { mimicClientHeaders: false } }).proxy;
+  const headers = buildPassthroughRequestHeaders({}, new URL('https://example.com/'), off);
+  assert.match(headers.get('user-agent') ?? '', /Mozilla\/5\.0/);
 });

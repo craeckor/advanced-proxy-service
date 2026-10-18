@@ -7,7 +7,10 @@ browse a site fully through the proxy.
 Includes:
 
 - **Header mimicry** — your real `User-Agent` and client headers are forwarded
-  upstream, so the origin sees a normal browser.
+  upstream, so the origin sees a normal browser. When a request carries no
+  `User-Agent` at all — which is the crawler's and the capture ingest's normal
+  case — a browser string is sent instead, because a request with none is
+  answered as a bot by a growing number of origins.
 - **Header rewriting** — `Content-Security-Policy`, `X-Frame-Options`,
   `Set-Cookie`, `Location` and friends are rewritten so the site works from the
   proxy's origin instead of the original site's.
@@ -438,6 +441,67 @@ Served unrewritten it is the proxy's own URL, so the derived directory is
 directory form it yields the target's real directory. The replacement is a string
 literal, which is safe in every legal position because `import.meta.url` is a
 read — `import.meta.url = x` is a syntax error.
+
+### Absolute URLs anywhere in a script
+
+The rewriters above only see a URL in a position they can predict: an attribute,
+a `fetch` argument, an `import` source. A page that keeps its API base in a
+variable and concatenates names a location in a position no signature predicts:
+
+```js
+var API = "https://api.example.com/v1";
+fetch(API + "/users");            // the value reaching fetch is not a literal
+```
+
+Left alone, that request leaves the proxy for the real origin. So a second pass
+rewrites **absolute `http(s)` URL literals wherever they appear** — in a variable,
+an object value, an array, a `switch` case, a `location.href` assignment.
+
+The filter is the *value*, not the position, and that is what makes a whole-file
+pass safe. A relative literal is a location only in a URL position — `"users"` is
+a path in `fetch("users")` and a key in `{ users: 1 }` — so rewriting those
+everywhere would corrupt ordinary data. An absolute URL is a location in every
+position it can legally appear.
+
+Three positions are still refused, because there the string is read as text:
+
+| Refused | Why |
+| --- | --- |
+| A property key — `{ "https://x": 1 }`, `obj["https://x"]` | Rewriting renames the property, so the lookup that follows silently misses. |
+| A comparison operand — `url === "https://x"` | The other side is usually `location.href`, which the shim already presents in the origin's own URL space. Rewriting one side makes a comparison that used to succeed fail. |
+| A regular expression — `new RegExp("https://x")`, `/https:\/\/x/` | A pattern matches text; a proxy path in one matches nothing. |
+
+A fourth is refused for a different reason: **`new URL(x)` with a single
+argument**, and the same for `new Request(x)` and `URL.parse(x)`. The native
+constructor requires an *absolute* URL when no base is supplied, so a proxy path
+there throws `Invalid URL` and takes the page down:
+
+```js
+new URL("https://api.example.com/v1")            // must stay absolute
+new URL("https://api.example.com/v1", base)      // a relative path is legal here
+```
+
+This is the one position where a proxy path is not a substitute for the URL it
+stands for. The shim's `URL` patch cannot help, because it is the *argument* that
+changed, not the constructor.
+
+A `switch` case is deliberately *not* refused: a case label and its subject are
+produced by the same code, so both move together and the branch keeps matching.
+
+The replacement uses the **directory form**, and that is not cosmetic. A literal
+in an arbitrary position is most often a base that the page concatenates onto,
+and the flat form loses the last path segment when it is:
+
+```text
+flat:  /proxy/plain/https%3A%2F%2Fapi.example.com%2Fv1   + "/users"  →  https://api.example.com/users
+dir:   /proxy/plain/https%3A%2F%2Fapi.example.com%2Fv1/v1 + "/users"  →  https://api.example.com/v1/users
+```
+
+The directory form appends the target's own pathname, so the concatenation lands
+where the origin would have put it.
+
+This pass runs on inline `<script>` content and on JavaScript responses. It does
+not run on JSON data blocks, which get the JSON walk instead.
 
 ### Requests the rewriters cannot see
 
@@ -1068,6 +1132,14 @@ visited it directly. What changes is the source address, not the identity: the
 service does not forge credentials it was not given, and it sends your cookie jar
 only to the origin the request belongs to — never to a third-party CDN, which
 would leak a session cookie for no benefit.
+
+The one header the service supplies rather than forwards is a `User-Agent`, and
+only when the request has none. That is not a disguise: a request with no
+`User-Agent` is a *distinctive* request, and origins act on it. Adobe's edge
+answers one with a 7-byte `OK Bot.` body and a `200`, which renders as a blank
+white page — the failure that motivated this. The crawler and the capture ingest
+are the paths that hit it, because they build their headers from an empty set
+while a browser always sends one on a navigation.
 
 ### Cross-origin reach
 

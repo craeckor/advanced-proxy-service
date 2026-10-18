@@ -412,7 +412,7 @@ export class ProxyHandler {
         // bare chunk name resolve somewhere sane, and `import.meta.url` is what
         // the runtime reads to form the name in the first place. Neither is
         // detectable from the source, which is why both are unconditional.
-        rewritten = rewriteJs(text, { codec, baseUrl, directoryForm: true, rewriteImportMetaUrl: true });
+        rewritten = rewriteJs(text, { codec, baseUrl, directoryForm: true, rewriteImportMetaUrl: true, rewriteUrlLiterals: true });
       }
     } catch (error) {
       this.#logger.error({ err: error, url: baseUrl, kind }, 'rewrite failed; returning original body');

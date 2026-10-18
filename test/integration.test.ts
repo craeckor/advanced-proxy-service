@@ -166,6 +166,29 @@ before(async () => {
         );
         return;
 
+      case '/hidden-urls.html':
+        // A page that keeps its API base in a variable and concatenates, which
+        // is the shape no API-signature rewriter can see.
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+        res.end(
+          `<!doctype html><html><head><title>hidden</title></head><body>` +
+            `<script>` +
+            `var API = "https://api.example.com/v1";` +
+            `var cfg = { endpoint: "https://api.example.com/v2", "https://api.example.com/key": 1 };` +
+            `fetch(API + "/users");` +
+            `if (location.href === "https://api.example.com/v1") {}` +
+            `var re = new RegExp("https://api.example.com");` +
+            `</script></body></html>`,
+        );
+        return;
+
+      case '/hidden-urls.js':
+        // The same hidden base, but in a JavaScript *response* rather than an
+        // inline script — the path that uses the directory form.
+        res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8' });
+        res.end(`var API = "https://api.example.com/v1";\nfetch(API + "/users");\n`);
+        return;
+
       case '/plain-manifest.json':
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(
@@ -624,6 +647,39 @@ test('REGRESSION: a request whose socket Node has already nulled is served, not 
     );
     assert.equal(outcome, 'resolved');
   }
+});
+
+test('REGRESSION: a URL hidden in a variable is routed through the proxy', async () => {
+  // The reported gap: a page that builds its API base in a variable and
+  // concatenates names a location in a position no API signature predicts, so
+  // the argument-position rewriter cannot see it. Left alone the request leaves
+  // the proxy for the real origin.
+  const response = await fetch(proxied('/hidden-urls.html'));
+  assert.equal(response.status, 200);
+  const body = await response.text();
+
+  // The base constant is routed, so the concatenation that follows stays inside.
+  // The directory form is used, so `API + "/users"` lands on `/v1/users` rather
+  // than losing the last segment.
+  assert.match(body, /var API = "\/proxy\/plain\/https%3A%2F%2Fapi\.example\.com%2Fv1\/v1";/);
+  // The concatenation itself is untouched — it is the base that had to move.
+  assert.match(body, /fetch\(API \+ "\/users"\);/);
+  // An object value is a location and is routed.
+  assert.match(body, /endpoint: "\/proxy\/plain\/https%3A%2F%2Fapi\.example\.com%2Fv2\/v2"/);
+
+  // And the three positions that are text rather than locations are untouched.
+  assert.match(body, /"https:\/\/api\.example\.com\/key": 1/, 'a property key must not be renamed');
+  assert.match(body, /location\.href === "https:\/\/api\.example\.com\/v1"/, 'a comparison must not be rewritten');
+  assert.match(body, /new RegExp\("https:\/\/api\.example\.com"\)/, 'a pattern must not be rewritten');
+});
+
+test('REGRESSION: a proxied script routes a hidden URL base too', async () => {
+  // The same pass runs on a JavaScript *response*, not only on an inline script,
+  // and there it uses the directory form so a concatenated path still resolves.
+  const response = await fetch(proxied('/hidden-urls.js'));
+  assert.equal(response.status, 200);
+  const body = await response.text();
+  assert.match(body, /var API = "\/proxy\/plain\/https%3A%2F%2Fapi\.example\.com%2Fv1\/v1";/);
 });
 
 test('passes a response larger than the rewrite budget through with a marker', async () => {

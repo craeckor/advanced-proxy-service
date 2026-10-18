@@ -403,6 +403,9 @@ function rewriteElementText(
         codec: options.codec,
         baseUrl: base,
         prefix: options.prefix,
+        // An inline script is where a hidden URL builder usually lives: a
+        // config object or a base constant that no API signature predicts.
+        rewriteUrlLiterals: true,
       });
     }
   }
