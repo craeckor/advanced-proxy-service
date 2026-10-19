@@ -165,15 +165,121 @@ export const RUNTIME_SHIM_SOURCE = String.raw`
     define(window, 'fetch', function (input, init) {
       if (typeof input === 'string' || input instanceof URL) return nativeFetch(toProxyUrl(input), init);
       if (typeof Request !== 'undefined' && input instanceof Request) {
-        try {
-          var copy = new Request(toProxyUrl(input.url), input);
-          return nativeFetch(copy, init);
-        } catch (e) {
-          return nativeFetch(input, init);
+        // Rebuilding a Request from another Request is not a copy: the
+        // constructor reads the source's body as a stream, and a stream body is
+        // illegal alongside keepalive. Snowplow sets exactly that pair, so
+        // new Request(proxied, input) throws — and the old fallback here sent
+        // the *original* request instead, which is a silent bypass of the proxy
+        // for every keepalive request on the page. The reported symptom was a
+        // CORS failure against ud.digitec.ch: the analytics beacon left the
+        // proxy on every page view and nothing in the document named the URL.
+        //
+        // Passing the stream through with duplex:'half' does not work either,
+        // and the reason is not obvious: a browser will only send a streaming
+        // request body over HTTP/2 or better. The proxy is reached over plain
+        // HTTP/1.1, so every streamed body fails at the network layer with a
+        // bare "Failed to fetch" — no status, no console detail. The body is
+        // therefore read into memory and sent as bytes, which is legal on any
+        // protocol version. The cost is buffering an upload; the alternative is
+        // a request that cannot be routed at all.
+        //
+        // keepalive is dropped rather than preserved: it exists to let a
+        // request outlive the page, and a request that must be routed through
+        // the proxy cannot also be one the browser sends on its own after the
+        // document is gone. Losing the tail of an analytics beacon is a far
+        // smaller cost than sending it to the real origin.
+        var proxiedUrl = toProxyUrl(input.url);
+        // init overrides the source request field by field, so it has to be
+        // sanitised too: a keepalive or a stream body arriving through init
+        // would reintroduce exactly the two failures described above. body is
+        // removed as well, because it is resolved separately below and a
+        // leftover stream there would override the buffered replacement.
+        var cleanInit = null;
+        if (init) {
+          cleanInit = {};
+          for (var key in init) {
+            if (key === 'keepalive' || key === 'duplex' || key === 'body') continue;
+            cleanInit[key] = init[key];
+          }
         }
+        var rebuild = function (body) {
+          var parts = {
+            method: input.method,
+            headers: input.headers,
+            mode: input.mode,
+            credentials: input.credentials,
+            cache: input.cache,
+            redirect: input.redirect,
+            referrer: input.referrer,
+            referrerPolicy: input.referrerPolicy,
+            integrity: input.integrity,
+            keepalive: false,
+            signal: input.signal
+          };
+          if (body !== undefined) parts.body = body;
+          return new Request(proxiedUrl, parts);
+        };
+        var send = function (body) {
+          try {
+            return nativeFetch(rebuild(body), cleanInit);
+          } catch (e) {
+            return Promise.reject(e);
+          }
+        };
+        // An explicit init.body replaces the source body outright, so there is
+        // nothing to read out of the original request in that case — but it may
+        // itself be a stream, which has to be buffered for the same reason.
+        var body = init && init.body !== undefined && init.body !== null ? init.body : input.body;
+        if (body === null || body === undefined) return send(undefined);
+        if (typeof ReadableStream !== 'undefined' && body instanceof ReadableStream) {
+          try {
+            return new Response(body).arrayBuffer().then(function (buffer) {
+              return send(buffer);
+            });
+          } catch (e) {
+            return Promise.reject(e);
+          }
+        }
+        if (typeof body === 'string' || body instanceof ArrayBuffer || ArrayBuffer.isView(body) ||
+            (typeof Blob !== 'undefined' && body instanceof Blob) ||
+            (typeof FormData !== 'undefined' && body instanceof FormData) ||
+            (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams)) {
+          return send(body);
+        }
+        // Anything else is a body the platform will not let us re-read. Falling
+        // back to the original would be the bypass this branch exists to
+        // prevent, so the request is refused instead — a failed request is
+        // visible, a leaked one is not.
+        return Promise.reject(new TypeError('proxy: request body cannot be re-read'));
       }
       return nativeFetch(input, init);
     });
+  }
+
+  // --- navigator.sendBeacon ------------------------------------------------
+  // A beacon is a fire-and-forget POST the browser sends on the page's behalf,
+  // and it is the one network API that is easy to forget because it is not a
+  // constructor and does not return a promise. Analytics libraries reach for it
+  // precisely because it survives unload, so an unpatched beacon is a request
+  // that leaves the proxy on every page view.
+  //
+  // The reported symptom was a CORS failure against ud.digitec.ch: the page's
+  // own config names that host as a bare hostname, the analytics library builds
+  // http://ud.digitec.ch/... from it, and the beacon went straight there from
+  // a page served by the proxy. Nothing in the document carried the URL, so no
+  // rewriter could see it.
+  //
+  // sendBeacon lives on Navigator.prototype and is both writable and
+  // configurable, so it can be replaced directly. The return value is the
+  // browser's boolean — false when the payload was too large to queue — and it
+  // is passed through unchanged.
+  if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+    var nativeSendBeacon = navigator.sendBeacon;
+    try {
+      define(navigator, 'sendBeacon', function (url, data) {
+        return nativeSendBeacon.call(navigator, toProxyUrl(url), data);
+      });
+    } catch (e) { /* not overridable in this browser */ }
   }
 
   // --- XMLHttpRequest ------------------------------------------------------

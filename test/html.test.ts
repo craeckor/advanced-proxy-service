@@ -110,11 +110,48 @@ test('a speculationrules URL is discovered as well as rewritten', () => {
   assert.ok(result.discovered.has('https://example.com/next'));
 });
 
+test('REGRESSION: a client-hints delegation list is dropped, not left pointing at the origin', () => {
+  // `<meta http-equiv="delegate-ch">` names the origins the browser may send
+  // client hints to, and the browser acts on it without the page's involvement.
+  // Left absolute, the browser contacts the real origin directly from a page
+  // that is supposed to be inside the proxy — the reported symptom was a CORS
+  // failure against `ud.digitec.ch` that no rewriter could reach.
+  const source =
+    '<meta http-equiv="delegate-ch" content="sec-ch-ua https://ud.example.com; sec-ch-ua-mobile https://ud.example.com">';
+  const out = rewriteHtml(source, options).html;
+
+  assert.equal(out.includes('ud.example.com'), false, 'the delegation list must not survive');
+  // The rest of the document is untouched.
+  assert.match(out, /<meta/);
+});
+
 test('a JSON-LD block is left byte-exact, because nothing fetches it', () => {
   // It is a data block, and rewriting it would corrupt structured data a
   // consumer is meant to read verbatim.
   const source = '<script type="application/ld+json">{"url":"https://example.com/a"}</script>';
   assert.equal(rewriteHtml(source, options).html.includes('https%3A'), false);
+});
+
+test('REGRESSION: an application/json data block is left byte-exact', () => {
+  // A general "rewrite every URL in a JSON block" pass was written and reverted,
+  // because a data block is the page's own state rather than a document: a URL
+  // in it is as likely to be an identity as a location, and the two are
+  // indistinguishable by value.
+  //
+  // On digitec's `__NEXT_DATA__` it rewrote `shopClientConfig.domain` — the
+  // site's own name, which the app compares against `location.origin` — and the
+  // page died during hydration with `Cannot read properties of undefined
+  // (reading 'split')`. It also appended a pathname to values that were already
+  // complete URLs, turning `/de` into `/de/de`.
+  const source =
+    '<script id="__NEXT_DATA__" type="application/json">' +
+    '{"assetPrefix":"https://cdn.example.net","domain":"https://example.com"}' +
+    '</script>';
+  const out = rewriteHtml(source, options).html;
+
+  assert.match(out, /"assetPrefix":"https:\/\/cdn\.example\.net"/, 'a data block must not be rewritten');
+  assert.match(out, /"domain":"https:\/\/example\.com"/);
+  assert.equal(out.includes('https%3A'), false);
 });
 
 test('leaves data: and javascript: references untouched', () => {

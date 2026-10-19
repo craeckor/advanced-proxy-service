@@ -42,6 +42,82 @@ test('the shim contains no backtick, which would terminate its template literal'
   );
 });
 
+test('REGRESSION: a keepalive Request is rebuilt, not passed through unproxied', () => {
+  // `new Request(proxiedUrl, existingRequest)` throws when the source has
+  // `keepalive: true`, because the constructor reads the body as a stream and a
+  // stream body is illegal alongside keepalive. The old code caught that and
+  // fell back to the *original* request — a silent bypass of the proxy for every
+  // keepalive request on the page.
+  //
+  // The reported symptom was a CORS failure against `ud.digitec.ch`: snowplow
+  // builds `new Request(collectorUrl, { keepalive: true })` and the beacon left
+  // the proxy on every page view. Nothing in the document named the URL, so no
+  // rewriter could reach it.
+  assert.match(RUNTIME_SHIM_SOURCE, /keepalive: false/, 'keepalive must be dropped, not preserved');
+  // The body must be buffered, not streamed. A browser only sends a streaming
+  // request body over HTTP/2 or better, and the proxy is reached over plain
+  // HTTP/1.1, so `duplex: 'half'` fails at the network layer with a bare
+  // "Failed to fetch" — no status, no console detail. This was the second half
+  // of the same bug and it is invisible in any test that only checks the URL.
+  assert.match(
+    RUNTIME_SHIM_SOURCE,
+    /input\.arrayBuffer\(\)|new Response\(body\)\.arrayBuffer\(\)/,
+    'the body must be buffered, because a stream body cannot cross HTTP/1.1',
+  );
+  assert.equal(
+    /duplex: 'half'/.test(RUNTIME_SHIM_SOURCE),
+    false,
+    'a streamed body cannot be sent to an HTTP/1.1 proxy',
+  );
+  assert.match(
+    RUNTIME_SHIM_SOURCE,
+    /Promise\.reject\(new TypeError\('proxy: request body cannot be re-read'\)\)/,
+    'a body that cannot be rebuilt must fail rather than leak',
+  );
+  // The old bypass must be gone: no fallback that sends the original request.
+  assert.equal(
+    /catch \(e\) \{\s*return nativeFetch\(input, init\);/.test(RUNTIME_SHIM_SOURCE),
+    false,
+    'the unproxied fallback must not come back',
+  );
+});
+
+test('REGRESSION: an init.body overrides the source body without leaking a stream', () => {
+  // `fetch(request, { body })` replaces the request's body outright. The
+  // replacement may itself be a stream, which cannot cross HTTP/1.1, so it has
+  // to be buffered like any other. The sanitised init must also drop `body`,
+  // otherwise the original stream would be re-applied on top of the buffered
+  // replacement and the request would fail for the reason just fixed.
+  assert.match(
+    RUNTIME_SHIM_SOURCE,
+    /key === 'keepalive' \|\| key === 'duplex' \|\| key === 'body'/,
+    'init.body must be stripped from the sanitised init',
+  );
+  assert.match(
+    RUNTIME_SHIM_SOURCE,
+    /init && init\.body !== undefined && init\.body !== null \? init\.body : input\.body/,
+    'an explicit init.body must take precedence over the source body',
+  );
+});
+
+test('the shim patches sendBeacon, which is a network API that is easy to miss', () => {
+  // A beacon is a fire-and-forget POST the browser sends on the page's behalf.
+  // It is not a constructor and returns no promise, so it is the one network API
+  // that gets forgotten — and analytics libraries reach for it precisely because
+  // it survives unload.
+  //
+  // The reported symptom was a CORS failure against `ud.digitec.ch`: the page's
+  // config names that host as a bare hostname, the analytics library builds a
+  // URL from it, and the beacon left the proxy on every page view. Nothing in
+  // the document carried the URL, so no rewriter could reach it.
+  assert.match(RUNTIME_SHIM_SOURCE, /navigator\.sendBeacon/, 'sendBeacon must be patched');
+  assert.match(
+    RUNTIME_SHIM_SOURCE,
+    /nativeSendBeacon\.call\(navigator, toProxyUrl\(url\), data\)/,
+    'the beacon URL must be routed through the proxy',
+  );
+});
+
 test('the shim references every config key the rewriter emits', () => {
   const out = rewriteHtml('<base href="/"><p>x</p>', {
     codec: 'plain',

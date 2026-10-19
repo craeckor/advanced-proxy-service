@@ -500,8 +500,54 @@ dir:   /proxy/plain/https%3A%2F%2Fapi.example.com%2Fv1/v1 + "/users"  →  https
 The directory form appends the target's own pathname, so the concatenation lands
 where the origin would have put it.
 
+The replacement is also **absolute**, and that is the fix for a real crash. A
+literal in an arbitrary position is not necessarily used as a location relative
+to the document; it is just as often handed to `new URL(x)`, which requires an
+absolute URL and throws `Invalid URL` on a relative one — and the call is usually
+several steps away from the literal, behind a variable:
+
+```js
+let host = process.env.IMAGE_HOST ?? "https://cdn.example.net";
+let name = new URL(host).hostname;      // throws if `host` is relative
+```
+
+No positional rule can see that, because the literal's parent is a variable
+declarator rather than the constructor call. Emitting an absolute URL removes the
+problem instead of predicting it: an absolute proxy URL is a legal argument to
+`new URL`, a legal base for concatenation, and a legal `src`, so it works in every
+position a relative one would have worked in and in the ones it would not. The
+origin comes from the request's `Host` header, so a proxy reached as `localhost`
+emits `localhost` and one reached as `127.0.0.1` emits `127.0.0.1` — a mismatch
+would be a cross-origin URL to the browser, which is what the rewrite exists to
+avoid.
+
 This pass runs on inline `<script>` content and on JavaScript responses. It does
-not run on JSON data blocks, which get the JSON walk instead.
+not run on JSON data blocks, and that is deliberate — see below.
+
+#### Why JSON data blocks are left alone
+
+A general "rewrite every URL in a JSON block" pass was written, and it broke a
+real page, and the reason is worth recording because the idea is tempting.
+
+A JSON data block is the page's own **state**, not a document. A URL in it is as
+likely to be an identity as a location, and the two are indistinguishable by
+value — both are absolute `http(s)` URLs. Running the walk over digitec's
+`__NEXT_DATA__` changed 22 values, and only some were locations:
+
+| Value | What rewriting it did |
+|---|---|
+| `shopClientConfig.domain` | the site's own name, compared against `location.origin`; rewritten, the comparison failed and the app threw during hydration |
+| `shopClientConfig.monolithInternal`, four sibling `*.host` entries | cluster-internal service addresses the browser never fetches; routing them accomplished nothing and corrupted config |
+| `alternateLinksByPath.links[].absoluteUrl` | a *complete* URL, but the directory form appended its pathname a second time — `/de` became `/de/de` |
+
+The last row is the general problem: a JSON value gives no signal about whether
+it is a prefix that will be concatenated onto or a complete URL, and the two need
+different rewrites. Guessing wrong is silent corruption.
+
+So only the two blocks where the **browser** is the consumer and the schema is
+fixed by a specification are rewritten — an importmap and a speculationrules
+block. Everything else is left byte-exact, and the shim handles the requests the
+page actually makes.
 
 ### Requests the rewriters cannot see
 
@@ -608,6 +654,75 @@ same way.
 Because every failure falls through to the original 404, the rebase can only turn
 a 404 into a real response — it cannot make a working request start failing.
 Disable it with `proxy.resolveUnknownPaths: false`.
+
+### What the shim has to patch, and why each one is easy to miss
+
+The shim is the only thing standing between a page and the real origin for any
+URL that no rewriter can see, so its coverage is a correctness property rather
+than a convenience. Three of its patches exist because a real page leaked past
+the others, and each leak had the same shape: the request was made by an API
+that is not a constructor and does not return a promise, so nothing about the
+call site looks like a network request.
+
+| API | Why it is easy to miss |
+|---|---|
+| `fetch` | the obvious one; patched first |
+| `XMLHttpRequest.prototype.open` | a method, not a constructor |
+| `Worker` / `SharedWorker` / `EventSource` / `WebSocket` | constructors, but rarely used for data |
+| `navigator.sendBeacon` | fire-and-forget, returns a boolean, and is the *only* API that survives unload — which is exactly why analytics libraries use it |
+| `new Request(...)` handed to `fetch` | the URL is fixed at construction, before `fetch` is called |
+
+`sendBeacon` was added after a page's analytics beacon left the proxy on every
+page view. The page's own config named the collector as a **bare hostname**
+(`ud.digitec.ch`, no scheme), the library built a URL from it, and nothing in the
+document carried that URL — so no rewriter could reach it and the beacon went
+straight to the real origin. The symptom was a CORS failure in the console, which
+is the mild version: the request had already left.
+
+The `Request` case is subtler and was a **silent bypass**. Rebuilding a request
+is not a copy:
+
+```js
+new Request(proxiedUrl, existingRequest)   // throws when existingRequest.keepalive
+```
+
+The constructor reads the source's body as a stream, and a stream body is illegal
+alongside `keepalive`. Snowplow sets exactly that pair, so the rebuild threw — and
+the old fallback sent the *original* request instead. Every keepalive request on
+the page therefore went to the real origin while the shim looked healthy. The
+request is now rebuilt from its parts with `keepalive` dropped, and a body that
+cannot be re-read is **refused rather than leaked**: a failed request is visible,
+a leaked one is not.
+
+### A streamed request body cannot cross HTTP/1.1
+
+The first fix for the `Request` case passed the source body through as a stream
+with `duplex: 'half'`. That is the documented way to forward a body without
+buffering it, and it still failed — with a bare `TypeError: Failed to fetch`, no
+status and nothing in the console.
+
+The reason is a browser rule that is easy to miss: **a streaming request body is
+only sent over HTTP/2 or better.** The proxy is reached over plain HTTP/1.1, so
+every streamed body died at the network layer before a single byte was written.
+The same request against an HTTPS origin succeeded, which is what made the
+protocol version, rather than the proxy, the culprit.
+
+The body is therefore read into memory and sent as bytes:
+
+```js
+input.arrayBuffer().then(buffer => nativeFetch(new Request(proxiedUrl, { ...parts, body: buffer })))
+```
+
+This is legal on any protocol version. The cost is buffering an upload; the
+alternative is a request that cannot be routed at all. The same buffering applies
+to a stream arriving through `init.body`, and `init` is sanitised of `keepalive`,
+`duplex` and `body` so a caller cannot reintroduce either failure.
+
+| Body type | How it is forwarded |
+|---|---|
+| `string`, `ArrayBuffer`, `ArrayBufferView`, `Blob`, `FormData`, `URLSearchParams` | passed through unchanged |
+| `ReadableStream` (from the request or from `init.body`) | buffered with `arrayBuffer()` first |
+| anything else, or a body already consumed | `Promise.reject` — never the unproxied original |
 
 ## Offline archiving
 
@@ -1195,10 +1310,13 @@ require not performing the very rewrite the proxy exists to perform.
 | **A site's `connect-src` on a console paste** | The policy belongs to that document, so a pasted script inherits it and cannot upload from there. The snippet falls back to a popup on this service (`/api/capture-relay.html`), which the policy does not restrict; a site that also sets `Cross-Origin-Opener-Policy: same-origin` severs `window.opener` and defeats the popup, in which case the snippet must be run on the relay page instead. Nothing lifts another site's CSP, and nothing here tries to. |
 | **Streamed and progressive media during capture** | A video or DASH/HLS stream is not a single URL to fetch, so the URL list carries the manifest rather than the segments. |
 | **Compressed bodies already in an archive** | `accept-encoding: identity` is requested for every capture so bodies stay rewritable. An origin that compresses regardless is stored as-is, with its `content-encoding` recorded, and replayed byte-exact with the encoding passed through — so it renders, but without the shim and therefore without link rewriting. |
+| **An origin that compresses a live response anyway** | The same `identity` request is made on the live proxy, and an origin or CDN that compresses regardless is relayed untouched with its `content-encoding` intact. That is deliberate: decoding those bytes as text produces mojibake, and the rewriting path would then strip the encoding and hand the browser binary garbage labelled `application/javascript`. The cost is that such a response is not rewritten, so its URLs stay absolute. |
+| **An origin that compresses *and omits* `content-encoding`** | `static03.galaxus.com` serves 300 KB of gzip as `text/javascript` with no encoding header at all, and which edge node answers decides whether you get that or plain text — so the same script is sometimes binary and sometimes fine. The header alone cannot catch it, so the body's first bytes are sniffed for **gzip and zlib-deflate only**, and the header is supplied before relaying. Brotli is deliberately *not* sniffed: it has no magic number, and its first byte is a window-size code whose low nibble is `0x0b` or `0x1b` for ordinary ASCII characters — `{`, `+`, `;`, `K`, `[`, `k`. An earlier version guessed at brotli that way and mislabelled a JSON manifest as brotli, which the browser then refused to decode (`ERR_CONTENT_DECODING_FAILED`). A false positive corrupts every JSON, JS and CSS response, which is far worse than missing an undeclared brotli body — so a body matching neither signature goes down the normal rewriting path. |
 | **A URL captured with a different query** | Off by default; with `archive.compatMode` on, a query-variant is *offered* rather than served, and nothing verifies that the variant is the page the origin would return. Whether a trailing parameter selects content is a fact about the origin that two URLs cannot establish, which is why the reader decides. See [Compatibility mode](#compatibility-mode). |
 | **A page that navigates to itself** | Resolved from the referrer, so the page it was already on is served rather than a substitute. This needs the referrer to be present and to name a replay URL in the same archive; a client that strips `Referer` gets the ordinary miss. |
 | **A SingleFile upload with no token configured** | `POST /api/singlefile` accepts any caller when `archive.restFormToken` is empty, and the extension cannot send anything but `Bearer`. Set the token on any deployment that is reachable by others; unlike `POST /api/archives`, an accepted upload contributes content the server never chose. |
 | **A SingleFile page's own fidelity** | The stored bytes are the extension's rendering, not the origin's response. Scripts are neutralised, resources are inlined, and the markup is the extension's serialisation — so a replay of it is a faithful copy of *a saved page*, not of the site. That is the point of the destination, but it is not interchangeable with a crawl. |
+| **A streamed request body** | A browser only sends a streaming request body over HTTP/2 or better, and the proxy is reached over plain HTTP/1.1. The shim therefore buffers such a body with `arrayBuffer()` before forwarding it, which is legal on any protocol version but costs memory proportional to the upload. A body that cannot be read at all (already consumed, or aborted) is refused rather than sent unproxied. |
 
 Also note that proxied content has its CSP, `X-Frame-Options` and related headers
 stripped by design — that is what makes the site work at the proxy's origin, and

@@ -53,7 +53,16 @@ const CSS_TEXT_ELEMENTS = new Set(['style']);
 /** Elements whose text content is JavaScript. */
 const JS_TEXT_ELEMENTS = new Set(['script']);
 
-/** Script types that are data blocks, not executable JavaScript. */
+/**
+ * Script types that are data blocks, not executable JavaScript.
+ *
+ * These are left byte-exact, and the reason is that a data block is not a
+ * document: it is the page's own state, and a URL inside it is as likely to be
+ * an identity as a location. `__NEXT_DATA__` is the case that proved it — its
+ * `shopClientConfig.domain` is the site's own name, and rewriting it to a proxy
+ * path makes the application compare its origin against a localhost URL and
+ * throw. See `rewriteJsonUrls` for the full account.
+ */
 const NON_JS_SCRIPT_TYPES = new Set([
   'application/json',
   'application/ld+json',
@@ -110,6 +119,14 @@ export interface HtmlRewriteOptions {
   cookiePathPrefix?: string;
   /** Origin of the proxied site, exposed to the shim. */
   targetOrigin?: string;
+  /**
+   * The proxy's own origin, used to make a rewritten URL literal absolute.
+   *
+   * An inline script's absolute URL literal is often a base that the page later
+   * hands to `new URL(x)`, which throws on a relative one. See
+   * `JsRewriteOptions.proxyOrigin`.
+   */
+  proxyOrigin?: string;
 }
 
 export interface HtmlRewriteResult {
@@ -344,6 +361,22 @@ function rewriteElementAttributes(
         attr.value = rewriteMetaRefresh(value, base, options, discovered);
       } else if (httpEquiv === 'content-security-policy') {
         removals.push(attr.name);
+      } else if (httpEquiv === 'delegate-ch') {
+        // `<meta http-equiv="delegate-ch">` is a Client Hints delegation list:
+        // a semicolon-separated set of `hint origin` pairs naming the origins
+        // the browser may send those hints to. The browser acts on it directly,
+        // so an origin left absolute is contacted by the browser itself — the
+        // page never sees the request and the shim cannot intercept it.
+        //
+        // The list is dropped rather than rewritten, and that is the honest
+        // choice: the hints are delegated *to the real origin*, and the proxy
+        // is not that origin. Rewriting the entries to the proxy would tell the
+        // browser to send digitec's client hints to localhost, which is not
+        // what the page asked for and gains nothing — the proxied request
+        // already carries the client's own headers, which is the whole point of
+        // this proxy. Dropping it stops the direct contact without pretending
+        // to a delegation that no longer applies.
+        removals.push(attr.name);
       }
       continue;
     }
@@ -406,6 +439,10 @@ function rewriteElementText(
         // An inline script is where a hidden URL builder usually lives: a
         // config object or a base constant that no API signature predicts.
         rewriteUrlLiterals: true,
+        // Absolute, for the same reason as a JavaScript response: an inline
+        // literal is often a base that is later handed to `new URL(x)`, and a
+        // relative one throws there. See `JsRewriteOptions.proxyOrigin`.
+        ...(options.proxyOrigin === undefined ? {} : { proxyOrigin: options.proxyOrigin }),
       });
     }
   }

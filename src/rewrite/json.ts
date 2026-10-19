@@ -175,3 +175,35 @@ export function rewriteSpeculationRules(body: string, options: JsonRewriteOption
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
+
+/*
+ * Why there is no general "rewrite every URL in a JSON data block" pass.
+ *
+ * It was written, and it broke a real page, and the reason is worth recording
+ * because the idea is tempting and will be proposed again.
+ *
+ * A JSON data block is the page's own *state*, not a document. A URL in it is
+ * as likely to be an identity as a location, and the two are indistinguishable
+ * by value — both are absolute `http(s)` URLs. Running the walk over digitec's
+ * `__NEXT_DATA__` changed 22 values, and only some of them were locations:
+ *
+ *   - `shopClientConfig.domain` is the site's own name. The application compares
+ *     it against `location.origin` to decide whether it is running on its real
+ *     host; rewritten to a proxy path, the comparison fails and the app throws
+ *     `Cannot read properties of undefined (reading 'split')` during hydration.
+ *   - `shopClientConfig.monolithInternal` and four sibling `*.host` entries are
+ *     cluster-internal service addresses. They are not fetched by the browser at
+ *     all, so routing them accomplishes nothing and only corrupts config.
+ *   - `alternateLinksByPath.links[].absoluteUrl` is a *complete* URL, but the
+ *     directory form appended its pathname a second time — `/de` became
+ *     `/de/de` — because the form exists for values that are prefixes.
+ *
+ * The last point is the general one: a JSON value gives no signal about whether
+ * it is a prefix that will be concatenated onto or a complete URL, and the two
+ * need different rewrites. Guessing wrong is silent corruption.
+ *
+ * So the two blocks that are rewritten are the two where the *browser* is the
+ * consumer and the schema is fixed by a specification — an importmap and a
+ * speculationrules block. Everything else is left alone, and the runtime shim
+ * handles the requests the page actually makes.
+ */

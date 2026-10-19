@@ -4,6 +4,7 @@ import { createServer, type Server } from 'node:http';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { gzipSync, gunzipSync } from 'node:zlib';
 import { parseConfig } from '../src/config.ts';
 import { createLogger } from '../src/util/logger.ts';
 import { UpstreamClient } from '../src/proxy/upstream.ts';
@@ -226,6 +227,34 @@ before(async () => {
       case '/huge':
         res.writeHead(200, { 'content-type': 'text/html' });
         res.end(`<html><body>${'x'.repeat(200_000)}</body></html>`);
+        return;
+
+      case '/compressed.js':
+        // An origin that compresses a rewritable body even though `identity` was
+        // requested — what a CDN in front of the origin does. The proxy must
+        // relay it rather than decode it as text.
+        {
+          const gz = gzipSync(Buffer.from(`var API = "https://api.example.com/v1";\n`, 'utf8'));
+          res.writeHead(200, {
+            'content-type': 'application/javascript; charset=utf-8',
+            'content-encoding': 'gzip',
+            'content-length': String(gz.byteLength),
+          });
+          res.end(gz);
+        }
+        return;
+
+      case '/undeclared-gzip.js':
+        // The shape `static03.galaxus.com` serves: gzip bytes with **no**
+        // `content-encoding` header at all. A header-only check cannot see it.
+        {
+          const gz = gzipSync(Buffer.from(`var API = "https://api.example.com/v1";\n`, 'utf8'));
+          res.writeHead(200, {
+            'content-type': 'text/javascript; charset=utf-8',
+            'content-length': String(gz.byteLength),
+          });
+          res.end(gz);
+        }
         return;
 
       case '/echo-headers':
@@ -660,12 +689,14 @@ test('REGRESSION: a URL hidden in a variable is routed through the proxy', async
 
   // The base constant is routed, so the concatenation that follows stays inside.
   // The directory form is used, so `API + "/users"` lands on `/v1/users` rather
-  // than losing the last segment.
-  assert.match(body, /var API = "\/proxy\/plain\/https%3A%2F%2Fapi\.example\.com%2Fv1\/v1";/);
+  // than losing the last segment. The URL is absolute because a literal in an
+  // arbitrary position may be handed to `new URL(x)`, which throws on a
+  // relative one — see the `new URL` regression test below.
+  assert.match(body, /var API = "http:\/\/127\.0\.0\.1:\d+\/proxy\/plain\/https%3A%2F%2Fapi\.example\.com%2Fv1\/v1";/);
   // The concatenation itself is untouched — it is the base that had to move.
   assert.match(body, /fetch\(API \+ "\/users"\);/);
   // An object value is a location and is routed.
-  assert.match(body, /endpoint: "\/proxy\/plain\/https%3A%2F%2Fapi\.example\.com%2Fv2\/v2"/);
+  assert.match(body, /endpoint: "http:\/\/127\.0\.0\.1:\d+\/proxy\/plain\/https%3A%2F%2Fapi\.example\.com%2Fv2\/v2"/);
 
   // And the three positions that are text rather than locations are untouched.
   assert.match(body, /"https:\/\/api\.example\.com\/key": 1/, 'a property key must not be renamed');
@@ -679,7 +710,114 @@ test('REGRESSION: a proxied script routes a hidden URL base too', async () => {
   const response = await fetch(proxied('/hidden-urls.js'));
   assert.equal(response.status, 200);
   const body = await response.text();
-  assert.match(body, /var API = "\/proxy\/plain\/https%3A%2F%2Fapi\.example\.com%2Fv1\/v1";/);
+  assert.match(body, /var API = "http:\/\/127\.0\.0\.1:\d+\/proxy\/plain\/https%3A%2F%2Fapi\.example\.com%2Fv1\/v1";/);
+});
+
+test('REGRESSION: a rewritten literal is absolute, so `new URL(x)` does not throw', async () => {
+  // The reported error: `TypeError: Failed to construct 'URL': Invalid URL` from
+  // inside a webpack chunk. The source was
+  //
+  //     let host = process.env.IMAGE_HOST ?? "https://cdn.example.net";
+  //     let name = new URL(host).hostname;
+  //
+  // The literal's parent is a variable declarator, not the constructor call, so
+  // no positional rule can refuse it — the value travels through a variable
+  // first. A relative proxy path is not a legal argument to `new URL`, so the
+  // rewrite broke the call outright.
+  //
+  // Emitting an absolute URL fixes it without predicting anything: an absolute
+  // proxy URL is legal in every position a relative one was, and in this one too.
+  const response = await fetch(proxied('/hidden-urls.js'));
+  const body = await response.text();
+
+  const literal = /var API = "([^"]+)"/.exec(body)?.[1];
+  assert.ok(literal !== undefined, 'the base constant must be rewritten');
+  assert.match(literal, /^http:\/\/127\.0\.0\.1:\d+\/proxy\/plain\//, 'the literal must be absolute');
+
+  // The page's own expression, evaluated exactly as the browser would.
+  assert.doesNotThrow(() => new URL(literal), 'new URL(x) must accept the rewritten literal');
+  assert.equal(new URL(literal).hostname, '127.0.0.1');
+
+  // And the concatenation the literal exists for still lands on the target.
+  assert.equal(
+    new URL(`${literal}/users`).pathname,
+    '/proxy/plain/https%3A%2F%2Fapi.example.com%2Fv1/v1/users',
+  );
+});
+
+test('REGRESSION: a compressed rewritable body is relayed intact, not decoded as text', async () => {
+  // The reported symptom: a JavaScript file that is sometimes binary and
+  // sometimes fine. An origin (or the CDN in front of it) compresses a body even
+  // though `identity` was requested; decoding those bytes as UTF-8 produces
+  // mojibake, and the rewriting path then strips `content-encoding` because the
+  // body it *meant* to send was uncompressed — so the browser receives binary
+  // garbage labelled `application/javascript`.
+  //
+  // Read over a raw socket because `fetch` transparently decompresses, which
+  // would hide exactly the thing under test.
+  const { connect } = await import('node:net');
+  const raw = await new Promise<Buffer>((resolve) => {
+    const chunks: Buffer[] = [];
+    const socket = connect(proxyPort, '127.0.0.1', () => {
+      socket.write(
+        `GET /proxy/plain/${encodeURIComponent(`http://127.0.0.1:${originPort}/compressed.js`)} HTTP/1.1\r\n` +
+          `Host: 127.0.0.1\r\nConnection: close\r\n\r\n`,
+      );
+    });
+    socket.on('data', (chunk) => chunks.push(chunk as Buffer));
+    socket.on('close', () => resolve(Buffer.concat(chunks)));
+  });
+
+  const separator = raw.indexOf('\r\n\r\n');
+  const head = raw.subarray(0, separator).toString('latin1');
+  const body = raw.subarray(separator + 4);
+
+  assert.match(head, /^HTTP\/1\.1 200/, 'the response must still be served');
+  assert.match(head, /content-encoding: gzip/i, 'the encoding must be passed through');
+  assert.equal(body[0], 0x1f, 'the gzip magic must survive');
+  assert.equal(body[1], 0x8b, 'the gzip magic must survive');
+  assert.equal(
+    gunzipSync(body).toString('utf8'),
+    'var API = "https://api.example.com/v1";\n',
+    'the bytes must be the origin\'s own, so the browser can decompress them',
+  );
+});
+
+test('REGRESSION: an undeclared compressed body is detected by its bytes and labelled', async () => {
+  // The reported case, from `static03.galaxus.com`: 300 KB of gzip served as
+  // `text/javascript` with **no** `content-encoding` header. A header-only check
+  // cannot see it, so the bytes are sniffed instead — and the header is then set
+  // so the browser decompresses what it is given.
+  const { connect } = await import('node:net');
+  const raw = await new Promise<Buffer>((resolve) => {
+    const chunks: Buffer[] = [];
+    const socket = connect(proxyPort, '127.0.0.1', () => {
+      socket.write(
+        `GET /proxy/plain/${encodeURIComponent(`http://127.0.0.1:${originPort}/undeclared-gzip.js`)} HTTP/1.1\r\n` +
+          `Host: 127.0.0.1\r\nAccept: */*\r\nSec-Fetch-Dest: script\r\nConnection: close\r\n\r\n`,
+      );
+    });
+    socket.on('data', (chunk) => chunks.push(chunk as Buffer));
+    socket.on('close', () => resolve(Buffer.concat(chunks)));
+  });
+
+  const separator = raw.indexOf('\r\n\r\n');
+  const head = raw.subarray(0, separator).toString('latin1');
+  const body = raw.subarray(separator + 4);
+
+  assert.match(head, /^HTTP\/1\.1 200/);
+  assert.match(
+    head,
+    /content-encoding: gzip/i,
+    'the encoding must be supplied, or the browser cannot decompress the body',
+  );
+  assert.equal(body[0], 0x1f, 'the gzip magic must survive');
+  assert.equal(body[1], 0x8b, 'the gzip magic must survive');
+  assert.equal(
+    gunzipSync(body).toString('utf8'),
+    'var API = "https://api.example.com/v1";\n',
+    'the body must be the origin\'s own bytes, decompressible by the browser',
+  );
 });
 
 test('passes a response larger than the rewrite budget through with a marker', async () => {

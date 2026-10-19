@@ -47,6 +47,29 @@ export interface JsRewriteOptions {
    * See `isRewritableUrlLiteral` for the positions that are still refused.
    */
   rewriteUrlLiterals?: boolean;
+  /**
+   * The proxy's own origin, used to make a rewritten literal *absolute*.
+   *
+   * A literal in an arbitrary position is not necessarily used as a location
+   * relative to the document. It is just as often handed to `new URL(x)`, which
+   * requires an absolute URL and throws `Invalid URL` on a relative one — and
+   * that call is frequently several steps away from the literal, behind a
+   * variable:
+   *
+   *     let host = process.env.IMAGE_HOST ?? "https://cdn.example.net";
+   *     let name = new URL(host).hostname;      // throws if `host` is relative
+   *
+   * No positional rule can see that, because the literal's parent is a variable
+   * declarator, not the constructor call. Emitting an absolute URL removes the
+   * problem instead of predicting it: an absolute proxy URL is a legal argument
+   * to `new URL`, a legal base for concatenation, and a legal `src`, so it works
+   * in every position a relative one would have worked in and in the ones it
+   * would not.
+   *
+   * When this is absent the literal pass emits the relative form, which is only
+   * safe for callers that know every literal is document-relative.
+   */
+  proxyOrigin?: string;
 }
 
 /** A string literal that denotes a location, tagged with how to interpret it. */
@@ -198,10 +221,18 @@ export function rewriteJs(input: string, options: JsRewriteOptions): string {
       // concatenation lands where the origin would have put it.
       const withPath = proxyPathWithTargetPath(options.codec, value, options.prefix);
 
+      // Absolute when the caller knows the proxy's origin, because a literal in
+      // an arbitrary position may be handed to `new URL(x)` — which throws on a
+      // relative one — and the call is usually behind a variable, so no
+      // positional rule can refuse it. See `proxyOrigin`.
+      const text = options.proxyOrigin === undefined
+        ? withPath
+        : new URL(withPath, options.proxyOrigin).href;
+
       edits.push({
         start: literal.start,
         end: literal.end,
-        text: `${quote}${escapeFor(withPath, quote)}${quote}`,
+        text: `${quote}${escapeFor(text, quote)}${quote}`,
       });
     });
   }

@@ -270,6 +270,15 @@ export class ProxyHandler {
     request: IncomingMessage,
     response: ServerResponse,
     capture = false,
+    /**
+     * A body already read from `upstream.body`.
+     *
+     * The rewriting path has to read the body to decide whether it can rewrite
+     * it, so by the time it discovers it cannot, the stream is spent. Passing
+     * the bytes here is what lets it fall back to a relay instead of losing the
+     * response.
+     */
+    buffered?: Uint8Array,
   ): Promise<void> {
     const headers = upstream.headers;
     const isRedirect = upstream.status >= 300 && upstream.status < 400;
@@ -289,6 +298,17 @@ export class ProxyHandler {
     // agent and no ledger, and the capture silently stops before it starts.
     // Re-pointing the Location restores the namespace the request asked for.
     if (capture && isRedirect) retargetLocation(headers, codec);
+
+    if (buffered !== undefined) {
+      headers.set('content-length', String(buffered.byteLength));
+      response.writeHead(upstream.status, headersToObject(headers));
+      if (request.method === 'HEAD') {
+        response.end();
+        return;
+      }
+      response.end(Buffer.from(buffered));
+      return;
+    }
 
     response.writeHead(upstream.status, headersToObject(headers));
 
@@ -322,11 +342,41 @@ export class ProxyHandler {
 
     const limit = this.#config.proxy.maxRewriteBytes;
 
+    // An origin is asked for `identity`, and most honour it — but not all, and
+    // the ones that do not are not always honest about it. Two shapes occur:
+    //
+    //   1. the body is compressed and `content-encoding` says so;
+    //   2. the body is compressed and `content-encoding` is **absent** — which
+    //      is what `static03.galaxus.com` does, serving 300 KB of gzip labelled
+    //      `text/javascript` with no encoding header at all.
+    //
+    // The second shape is why the header alone is not enough. Decoding those
+    // bytes as text produces mojibake, and the rewriting path then strips
+    // `content-encoding` (because the body it *meant* to send was uncompressed),
+    // so the browser receives binary garbage labelled `application/javascript`.
+    // That is the reported symptom: a script that is sometimes binary and
+    // sometimes fine, depending on which edge node answered.
+    //
+    // So the bytes are checked as well as the header. A compressed body is
+    // relayed untouched, exactly as the passthrough path already does. The cost
+    // is that such a response is not rewritten — its URLs stay absolute — which
+    // is the honest trade: a script that runs unrewritten is better than one
+    // that does not parse at all.
+    const encoding = (upstream.headers.get('content-encoding') ?? '').trim().toLowerCase();
+    const declaredCompressed = encoding !== '' && encoding !== 'identity';
+    if (declaredCompressed) {
+      this.#logger.debug(
+        { url: target.href, encoding, kind },
+        'origin compressed a rewritable body; relaying it unrewritten',
+      );
+      await this.#passthrough(upstream, target, codec, request, response, capture);
+      return;
+    }
+
     let bytes: Uint8Array;
     try {
       bytes = await readAll(upstream.body, limit);
-    } catch (error) {
-      if ((error as Error).message === 'BODY_TOO_LARGE') {
+    } catch (error) {      if ((error as Error).message === 'BODY_TOO_LARGE') {
         // Over the rewrite budget: relay what was read unchanged rather than
         // failing the request outright. The bytes stop at the limit, so this is
         // a truncated response rather than a hung one, and the log says so.
@@ -348,6 +398,24 @@ export class ProxyHandler {
         return;
       }
       throw error;
+    }
+
+    // The header said nothing, but the bytes may still be compressed — see the
+    // note above. Checked here rather than before the read because the signature
+    // is in the body, and a body that is already in memory costs nothing to
+    // inspect.
+    const sniffed = sniffCompression(bytes);
+    if (sniffed !== null) {
+      this.#logger.debug(
+        { url: target.href, sniffed, kind },
+        'origin sent a compressed body with no content-encoding; relaying it unrewritten',
+      );
+      // The header is set so the browser decompresses what it is given. Without
+      // it the bytes are delivered as-is and the script does not parse.
+      upstream.headers.set('content-encoding', sniffed);
+      upstream.headers.delete('content-length');
+      await this.#passthrough(upstream, target, codec, request, response, capture, bytes);
+      return;
     }
 
     // Charset handling: decode what we can recognise, default to UTF-8.
@@ -394,6 +462,7 @@ export class ProxyHandler {
             : {}),
           cookiePathPrefix: '/',
           targetOrigin: target.origin,
+          proxyOrigin: proxyOrigin(request),
         }).html;
       } else if (kind === 'css') {
         rewritten = rewriteCss(text, { codec, baseUrl });
@@ -412,7 +481,14 @@ export class ProxyHandler {
         // bare chunk name resolve somewhere sane, and `import.meta.url` is what
         // the runtime reads to form the name in the first place. Neither is
         // detectable from the source, which is why both are unconditional.
-        rewritten = rewriteJs(text, { codec, baseUrl, directoryForm: true, rewriteImportMetaUrl: true, rewriteUrlLiterals: true });
+        rewritten = rewriteJs(text, {
+          codec,
+          baseUrl,
+          directoryForm: true,
+          rewriteImportMetaUrl: true,
+          rewriteUrlLiterals: true,
+          proxyOrigin: proxyOrigin(request),
+        });
       }
     } catch (error) {
       this.#logger.error({ err: error, url: baseUrl, kind }, 'rewrite failed; returning original body');
@@ -536,6 +612,48 @@ async function pipeNodeToNode(source: Readable, response: ServerResponse): Promi
   });
 }
 
+/**
+ * The compression a body is actually in, judged by its first bytes.
+ *
+ * Needed because an origin can compress a response and omit `content-encoding`
+ * entirely — `static03.galaxus.com` serves 300 KB of gzip labelled
+ * `text/javascript` with no encoding header. Trusting the header there means
+ * decoding a gzip stream as text, which produces mojibake that no rewriter can
+ * parse and that the browser cannot decompress either.
+ *
+ * **Only gzip and zlib-deflate are recognised, and that is deliberate.** Both
+ * have a real signature: gzip starts `1f 8b`, and a zlib stream's two-byte
+ * header is a multiple of 31 with a deflate method nibble. Brotli has no magic
+ * number at all — its first byte is a window-size code, and the low nibble of
+ * that byte is `0x0b` or `0x1b` for ordinary ASCII characters like `{`, `+`,
+ * `;`, `K`, `[` and `k`. An earlier version of this function guessed at brotli
+ * that way and mislabelled a JSON manifest as brotli, which the browser then
+ * refused to decode (`ERR_CONTENT_DECODING_FAILED`).
+ *
+ * So brotli is not sniffed. A brotli body that arrives without a header is
+ * relayed as-is and fails to parse, which is the same outcome as before this
+ * function existed — but a *text* body is never mislabelled, and that is the
+ * failure that actually broke a page.
+ *
+ * A body matching neither signature returns null and goes down the normal
+ * rewriting path.
+ */
+function sniffCompression(bytes: Uint8Array): 'gzip' | 'deflate' | null {
+  if (bytes.byteLength < 2) return null;
+
+  // gzip: 1f 8b, then a deflate method byte of 08.
+  if (bytes[0] === 0x1f && bytes[1] === 0x8b) return 'gzip';
+
+  // zlib-wrapped deflate: a CMF byte whose low nibble is 8 (deflate) and whose
+  // two-byte header is a multiple of 31. Raw deflate has no header at all and is
+  // deliberately not guessed at — it is indistinguishable from arbitrary bytes.
+  const cmf = bytes[0] as number;
+  const flg = bytes[1] as number;
+  if ((cmf & 0x0f) === 0x08 && ((cmf << 8) | flg) % 31 === 0) return 'deflate';
+
+  return null;
+}
+
 function charsetOf(contentType: string | null): string | null {
   if (contentType === null) return null;
   const match = /charset\s*=\s*"?([\w-]+)"?/i.exec(contentType);
@@ -567,6 +685,23 @@ function charsetOf(contentType: string | null): string | null {
  */
 function isSecure(request: IncomingMessage): boolean {
   return (request.socket as { encrypted?: boolean } | null)?.encrypted === true;
+}
+
+/**
+ * The origin this proxy is being reached at, as the browser sees it.
+ *
+ * Taken from the request's `Host` header rather than from configuration,
+ * because the two differ whenever the proxy is reached by a name other than the
+ * one it binds to — `localhost` versus `127.0.0.1` is the everyday case, and a
+ * rewritten literal that names the wrong one is a cross-origin URL to the
+ * browser, which is exactly what the rewrite exists to avoid.
+ *
+ * The scheme follows `isSecure`, so a proxy behind TLS emits `https:` URLs.
+ */
+function proxyOrigin(request: IncomingMessage): string {
+  const host = request.headers.host;
+  if (host === undefined || host === '') return 'http://localhost';
+  return `${isSecure(request) ? 'https' : 'http'}://${host}`;
 }
 
 /** Convert a `Headers` instance into a plain object Node will accept. */
